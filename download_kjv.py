@@ -3,74 +3,160 @@
 One-time setup: download the public-domain KJV Bible JSON and save as kjv.json.
 
 Sources tried in order:
-  1. thiagobodruk/bible on GitHub (chapters array format)
-  2. Fallback: aruljohn/popular-quotations (skipped — not a full Bible)
+  1. farskipper/kjv — pure KJV 1769, single file, reference-keyed JSON
+  2. aruljohn/Bible-kjv — 66 book files, hierarchical structure
+  3. scrollmapper/bible_databases — flat b/c/v/t format (last resort)
 
 Run once before starting the MCP server:
     python download_kjv.py
 """
 
 import json
+import re
 import sys
 import urllib.request
 from pathlib import Path
 
 OUT = Path(__file__).parent / "kjv.json"
 
-SOURCES = [
-    # Format: [{abbrev, name/book, chapters: [["verse",...],...]}, ...]
-    # Note: this file has a UTF-8 BOM — decoded with utf-8-sig below
-    "https://raw.githubusercontent.com/thiagobodruk/bible/master/json/en_kjv.json",
-    # Flat verse format: [{b, c, v, t}, ...]
-    "https://raw.githubusercontent.com/scrollmapper/bible_databases/master/json/t_kjv.json",
-    # Another chapters-array mirror
-    "https://raw.githubusercontent.com/jadenzaleski/bible-json/main/KJV/KJV.json",
+BOOK_NAMES = [
+    "Genesis","Exodus","Leviticus","Numbers","Deuteronomy","Joshua","Judges",
+    "Ruth","1 Samuel","2 Samuel","1 Kings","2 Kings","1 Chronicles",
+    "2 Chronicles","Ezra","Nehemiah","Esther","Job","Psalms","Proverbs",
+    "Ecclesiastes","Song of Solomon","Isaiah","Jeremiah","Lamentations",
+    "Ezekiel","Daniel","Hosea","Joel","Amos","Obadiah","Jonah","Micah",
+    "Nahum","Habakkuk","Zephaniah","Haggai","Zechariah","Malachi",
+    "Matthew","Mark","Luke","John","Acts","Romans","1 Corinthians",
+    "2 Corinthians","Galatians","Ephesians","Philippians","Colossians",
+    "1 Thessalonians","2 Thessalonians","1 Timothy","2 Timothy","Titus",
+    "Philemon","Hebrews","James","1 Peter","2 Peter","1 John","2 John",
+    "3 John","Jude","Revelation",
 ]
 
 
-def _fix_scrollmapper(data: list) -> list:
+def _fetch(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "kjv-mcp-setup/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read()
+
+
+def _clean_text(text: str) -> str:
+    """Strip farskipper formatting markers from verse text.
+
+    # marks a paragraph break within a verse — remove it.
+    [word] marks italicised supplied words — keep the word, drop the brackets.
     """
-    scrollmapper format: {"books": [{"book_id":1,"book_name":"Genesis","chapters":[...]}]}
-    or flat: [{"b":1,"c":1,"v":1,"t":"..."}]
-    Normalise to thiagobodruk shape.
+    text = text.replace("#", "")
+    text = re.sub(r"\[([^\]]*)\]", r"\1", text)
+    return text.strip()
+
+
+def _try_farskipper() -> list | None:
+    """Primary source: farskipper/kjv — pure KJV 1769 text.
+
+    Format: {"Genesis 1:1": "verse text", ...}
+    Returns flat list of {book, chapter, verse, text} dicts, or None on failure.
     """
-    # flat verse-per-entry format
-    if data and "t" in data[0]:
-        # Need a book-number→name mapping
-        book_names = [
-            "Genesis","Exodus","Leviticus","Numbers","Deuteronomy","Joshua","Judges",
-            "Ruth","1 Samuel","2 Samuel","1 Kings","2 Kings","1 Chronicles",
-            "2 Chronicles","Ezra","Nehemiah","Esther","Job","Psalms","Proverbs",
-            "Ecclesiastes","Song of Solomon","Isaiah","Jeremiah","Lamentations",
-            "Ezekiel","Daniel","Hosea","Joel","Amos","Obadiah","Jonah","Micah",
-            "Nahum","Habakkuk","Zephaniah","Haggai","Zechariah","Malachi",
-            "Matthew","Mark","Luke","John","Acts","Romans","1 Corinthians",
-            "2 Corinthians","Galatians","Ephesians","Philippians","Colossians",
-            "1 Thessalonians","2 Thessalonians","1 Timothy","2 Timothy","Titus",
-            "Philemon","Hebrews","James","1 Peter","2 Peter","1 John","2 John",
-            "3 John","Jude","Revelation",
-        ]
-        books: dict = {}
-        for entry in data:
-            b = int(entry["b"]) - 1
-            c = int(entry["c"]) - 1
-            v = int(entry["v"]) - 1
-            t = entry["t"]
-            if b not in books:
-                books[b] = {"name": book_names[b] if b < len(book_names) else f"Book {b+1}", "chapters": {}}
-            if c not in books[b]["chapters"]:
-                books[b]["chapters"][c] = {}
-            books[b]["chapters"][c][v] = t
-        result = []
-        for b_idx in sorted(books):
-            bk = books[b_idx]
-            chapters = []
-            for c_idx in sorted(bk["chapters"]):
-                ch = bk["chapters"][c_idx]
-                chapters.append([ch[v_idx] for v_idx in sorted(ch)])
-            result.append({"name": bk["name"], "chapters": chapters})
-        return result
-    return data
+    url = "https://raw.githubusercontent.com/farskipper/kjv/master/json/verses-1769.json"
+    print(f"Trying farskipper/kjv: {url}")
+    try:
+        raw = json.loads(_fetch(url).decode("utf-8"))
+    except Exception as exc:
+        print(f"  Failed: {exc}")
+        return None
+
+    if not isinstance(raw, dict):
+        print("  Unexpected format (expected dict).")
+        return None
+
+    verses = []
+    for ref, text in raw.items():
+        m = re.match(r"^(.+?)\s+(\d+):(\d+)$", ref)
+        if not m:
+            continue
+        verses.append({
+            "book": m.group(1),
+            "chapter": int(m.group(2)),
+            "verse": int(m.group(3)),
+            "text": _clean_text(str(text)),
+        })
+
+    if not verses:
+        print("  No verses parsed.")
+        return None
+
+    print(f"  Parsed {len(verses):,} verses.")
+    return verses
+
+
+def _try_aruljohn() -> list | None:
+    """Fallback: aruljohn/Bible-kjv — 66 book files.
+
+    Format per file: {"book": "Genesis", "chapters":
+        [{"chapter":"1", "verses":[{"verse":"1","text":"..."},...]},...]}
+    """
+    books_url = "https://raw.githubusercontent.com/aruljohn/Bible-kjv/master/Books.json"
+    print(f"Trying aruljohn/Bible-kjv: {books_url}")
+    try:
+        book_list = json.loads(_fetch(books_url).decode("utf-8"))
+    except Exception as exc:
+        print(f"  Failed to fetch book list: {exc}")
+        return None
+
+    verses = []
+    for book_name in book_list:
+        file_name = book_name.replace(" ", "") + ".json"
+        url = f"https://raw.githubusercontent.com/aruljohn/Bible-kjv/master/{file_name}"
+        try:
+            book_data = json.loads(_fetch(url).decode("utf-8"))
+        except Exception as exc:
+            print(f"  Failed to fetch {file_name}: {exc}")
+            return None
+
+        for chap in book_data.get("chapters", []):
+            c = int(chap["chapter"])
+            for v_entry in chap.get("verses", []):
+                verses.append({
+                    "book": book_name,
+                    "chapter": c,
+                    "verse": int(v_entry["verse"]),
+                    "text": v_entry["text"].strip(),
+                })
+
+    if not verses:
+        print("  No verses parsed.")
+        return None
+
+    print(f"  Parsed {len(verses):,} verses.")
+    return verses
+
+
+def _try_scrollmapper() -> list | None:
+    """Last resort: scrollmapper flat b/c/v/t format."""
+    url = "https://raw.githubusercontent.com/scrollmapper/bible_databases/master/json/t_kjv.json"
+    print(f"Trying scrollmapper: {url}")
+    try:
+        raw = json.loads(_fetch(url).decode("utf-8"))
+    except Exception as exc:
+        print(f"  Failed: {exc}")
+        return None
+
+    if not (isinstance(raw, list) and raw and "t" in raw[0]):
+        print("  Unexpected format.")
+        return None
+
+    verses = []
+    for entry in raw:
+        b = int(entry["b"]) - 1
+        verses.append({
+            "book": BOOK_NAMES[b] if b < len(BOOK_NAMES) else f"Book {b+1}",
+            "chapter": int(entry["c"]),
+            "verse": int(entry["v"]),
+            "text": entry["t"].strip(),
+        })
+
+    print(f"  Parsed {len(verses):,} verses.")
+    return verses
 
 
 def download() -> None:
@@ -78,60 +164,31 @@ def download() -> None:
         print(f"kjv.json already exists at {OUT} — delete it to re-download.")
         return
 
-    for url in SOURCES:
-        print(f"Trying {url} ...")
-        try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "kjv-mcp-setup/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                content = resp.read()
-            # utf-8-sig strips BOM if present, harmless if not
-            raw = json.loads(content.decode("utf-8-sig"))
-        except Exception as exc:
-            print(f"  Failed: {exc}")
-            continue
-
-        # Normalise if needed
-        if isinstance(raw, dict) and "books" in raw:
-            raw = raw["books"]
-        if raw and ("t" in raw[0] or "b" in raw[0]):
-            raw = _fix_scrollmapper(raw)
-
-        # Validate: must have chapters arrays
-        if not (isinstance(raw, list) and raw and "chapters" in raw[0]):
-            print("  Unexpected format, skipping.")
-            continue
-
-        # Quick sanity check — Genesis 1:1 should contain "beginning"
-        try:
-            first_verse = raw[0]["chapters"][0][0]
-            assert "beginning" in first_verse.lower(), first_verse
-        except Exception as exc:
-            print(f"  Sanity check failed: {exc}, skipping.")
-            continue
-
-        # Ensure 'name' key (some sources use 'book')
-        for entry in raw:
-            if "name" not in entry and "book" in entry:
-                entry["name"] = entry["book"]
-
-        with open(OUT, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False, separators=(",", ":"))
-
-        total = sum(
-            len(ch) for bk in raw for ch in bk["chapters"]
-        )
-        print(f"Saved {total:,} verses to {OUT}")
-        return
-
-    print(
-        "\nAll sources failed. Please download a KJV JSON manually and save it\n"
-        f"as: {OUT}\n\n"
-        "Expected format:\n"
-        '  [{"name": "Genesis", "chapters": [["In the beginning...", ...], ...]}, ...]\n'
+    verses = (
+        _try_farskipper()
+        or _try_aruljohn()
+        or _try_scrollmapper()
     )
-    sys.exit(1)
+
+    if not verses:
+        print(
+            "\nAll sources failed. Please download a KJV JSON manually and save it\n"
+            f"as: {OUT}\n\n"
+            'Expected format: [{"book":"Genesis","chapter":1,"verse":1,"text":"..."},...]\n'
+        )
+        sys.exit(1)
+
+    # Sanity check — Genesis 1:1 should contain "beginning"
+    first = next((v for v in verses if v["chapter"] == 1 and v["verse"] == 1
+                  and v["book"] == "Genesis"), None)
+    if not first or "beginning" not in first["text"].lower():
+        print(f"  Sanity check failed on Genesis 1:1: {first}")
+        sys.exit(1)
+
+    with open(OUT, "w", encoding="utf-8") as f:
+        json.dump(verses, f, ensure_ascii=False, separators=(",", ":"))
+
+    print(f"Saved {len(verses):,} verses to {OUT}")
 
 
 if __name__ == "__main__":

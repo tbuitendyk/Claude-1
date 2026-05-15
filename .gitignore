@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*.json
+!railway.json
+venv/
+.env

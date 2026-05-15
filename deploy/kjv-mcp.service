@@ -1,0 +1,18 @@
+[Unit]
+Description=KJV Bible Verse Lookup MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=kjvmcp
+Group=kjvmcp
+WorkingDirectory=/opt/kjv-mcp
+EnvironmentFile=/etc/kjv-mcp/env
+ExecStart=/opt/kjv-mcp/venv/bin/python server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
